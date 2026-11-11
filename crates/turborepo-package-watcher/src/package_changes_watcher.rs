@@ -680,6 +680,28 @@ impl Subscriber {
         true
     }
 
+    /// Re-hashes every package in the graph and reports whether all of them
+    /// still match their baseline. Every package is checked, so each baseline
+    /// is refreshed even after the first mismatch. A failed hash query counts
+    /// as a change.
+    async fn all_packages_unchanged(
+        &self,
+        pkg_dep_graph: &PackageGraph,
+        package_file_hashes: &mut HashMap<PackageName, PackageHashBaseline>,
+    ) -> bool {
+        let mut unchanged = true;
+        for package in hash_scopes(pkg_dep_graph) {
+            if !self
+                .is_same_hash(pkg_dep_graph, &package, package_file_hashes)
+                .await
+            {
+                tracing::debug!(package = %package.name, "package contents changed");
+                unchanged = false;
+            }
+        }
+        unchanged
+    }
+
     async fn hash_baseline(
         &self,
         pkg_dep_graph: &PackageGraph,
@@ -901,6 +923,20 @@ impl Subscriber {
                 last_batch_at = Some(tokio::time::Instant::now());
 
                 let ChangedFiles::Some(trie) = changed_files else {
+                    // `All` means the watcher lost track of which files changed
+                    // (a backend rescan, a lagged channel, or an unrepresentable
+                    // path), not that anything did. Re-hash every package against
+                    // its baseline and rediscover only if some content differs.
+                    if self
+                        .all_packages_unchanged(&repo_state.pkg_dep_graph, &mut package_file_hashes)
+                        .await
+                    {
+                        tracing::info!(
+                            "file watcher lost events, but no package contents changed; skipping \
+                             rediscovery"
+                        );
+                        continue;
+                    }
                     rediscover!(self, repo_state, change_mapper);
                     continue;
                 };
