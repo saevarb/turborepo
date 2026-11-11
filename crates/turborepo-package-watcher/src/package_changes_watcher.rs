@@ -289,6 +289,80 @@ fn replace_baseline(
     same
 }
 
+/// For each hash scope, the directories of the other scopes nested inside it,
+/// relative to it and ending in `/`. A scope's hashes also cover the files of
+/// the scopes nested inside it (the root covers the whole repository), but
+/// those files belong to the nested scope, whose own baseline is the one kept
+/// current when they change.
+fn nested_scope_dirs(scopes: &[WorkspacePackage]) -> HashMap<PackageName, Vec<String>> {
+    scopes
+        .iter()
+        .map(|outer| {
+            let outer_dir = outer.path.to_unix().to_string();
+            let nested = scopes
+                .iter()
+                .filter_map(|inner| {
+                    let inner_dir = inner.path.to_unix().to_string();
+                    if inner_dir == outer_dir {
+                        return None;
+                    }
+                    let relative = if outer_dir.is_empty() {
+                        inner_dir.as_str()
+                    } else {
+                        inner_dir
+                            .strip_prefix(outer_dir.as_str())?
+                            .strip_prefix('/')?
+                    };
+                    Some(format!("{relative}/"))
+                })
+                .collect();
+            (outer.name.clone(), nested)
+        })
+        .collect()
+}
+
+/// Compares a package's current hashes with its baseline over the files the
+/// package owns, leaving out files under `nested_dirs`, which their own
+/// packages compare. Returns `None` when they match, otherwise a description
+/// of the difference: the number of added, removed or modified files and up
+/// to five of their paths.
+fn baseline_difference(
+    baseline: Option<&PackageHashBaseline>,
+    path: &AnchoredSystemPath,
+    hashes: &GitHashes,
+    nested_dirs: &[String],
+) -> Option<String> {
+    let Some(baseline) = baseline else {
+        return Some("no previous hashes".to_string());
+    };
+    if baseline.path.as_str() != path.as_str() {
+        return Some(format!("package moved from {}", baseline.path));
+    }
+    let owned = |file: &str| !nested_dirs.iter().any(|dir| file.starts_with(dir.as_str()));
+    let previous = baseline.hashes.as_ref();
+    let mut differing: Vec<&str> = previous
+        .iter()
+        .filter(|(file, hash)| owned(file.as_str()) && hashes.get(*file) != Some(*hash))
+        .map(|(file, _)| file.as_str())
+        .chain(
+            hashes
+                .keys()
+                .filter(|file| owned(file.as_str()) && !previous.contains_key(*file))
+                .map(|file| file.as_str()),
+        )
+        .collect();
+    if differing.is_empty() {
+        return None;
+    }
+    differing.sort_unstable();
+    let total = differing.len();
+    differing.truncate(5);
+    Some(format!(
+        "{total} file(s) differ, including {}",
+        differing.join(", ")
+    ))
+}
+
 /// The outcome of re-hashing every package after the file watcher lost track
 /// of which files changed.
 enum Recheck {
@@ -694,8 +768,10 @@ impl Subscriber {
     }
 
     /// Re-hashes every package after the file watcher lost track of which
-    /// files changed. Every package is checked, so each baseline is refreshed
-    /// even after the first mismatch.
+    /// files changed, comparing each against its baseline over the files it
+    /// owns (files of nested packages are compared by those packages). Every
+    /// package is checked, so each baseline is refreshed even after the first
+    /// mismatch.
     ///
     /// A lookup the hash watcher answers with `Unavailable` was cut short by
     /// another flush and says nothing about the files. If that flush came with
@@ -708,7 +784,13 @@ impl Subscriber {
     ) -> Recheck {
         let mut changed = false;
         let mut interrupted = false;
-        for package in hash_scopes(pkg_dep_graph) {
+        let scopes: Vec<WorkspacePackage> = hash_scopes(pkg_dep_graph).collect();
+        let nested = nested_scope_dirs(&scopes);
+        for package in scopes {
+            let nested_dirs = nested
+                .get(&package.name)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
             let Some(context) = pkg_dep_graph.package_task_context(&package.name) else {
                 changed = true;
                 continue;
@@ -721,19 +803,39 @@ impl Subscriber {
                     inputs: InputGlobs::Default,
                 })
                 .await;
+            // The default log format drops structured fields, so these messages
+            // carry the package and files in their text.
             match lookup {
                 Ok(hash) => {
-                    if !replace_baseline(package_file_hashes, &package.name, package_path, hash) {
-                        tracing::debug!(package = %package.name, "package contents changed");
+                    if let Some(difference) = baseline_difference(
+                        package_file_hashes.get(&package.name),
+                        &package_path,
+                        hash.as_ref(),
+                        nested_dirs,
+                    ) {
+                        tracing::info!(
+                            "package {} changed while file events were lost: {difference}",
+                            package.name
+                        );
                         changed = true;
                     }
+                    package_file_hashes.insert(
+                        package.name.clone(),
+                        PackageHashBaseline {
+                            path: package_path,
+                            hashes: hash,
+                        },
+                    );
                 }
                 Err(HashWatcherError::Unavailable(reason)) => {
                     tracing::debug!(package = %package.name, %reason, "hash lookup interrupted");
                     interrupted = true;
                 }
                 Err(error) => {
-                    tracing::debug!(package = %package.name, %error, "hash lookup failed");
+                    tracing::info!(
+                        "hashing package {} failed while file events were lost: {error}",
+                        package.name
+                    );
                     changed = true;
                 }
             }
@@ -743,6 +845,10 @@ impl Subscriber {
         } else if !interrupted {
             Recheck::Unchanged
         } else if self.changed_files.lock().await.borrow().is_empty() {
+            tracing::info!(
+                "some packages could not be re-hashed after lost file events and no newer \
+                 invalidation arrived; treating them as changed"
+            );
             Recheck::Changed
         } else {
             Recheck::Superseded
@@ -1040,6 +1146,16 @@ impl Subscriber {
                                 });
                             if !keep_root {
                                 filtered_pkgs.remove(&root_pkg);
+                                // Nothing reports this change, but the root's
+                                // baseline must still follow it, or the next
+                                // re-check after lost file events would see it
+                                // as a change.
+                                self.is_same_hash(
+                                    &repo_state.pkg_dep_graph,
+                                    &root_pkg,
+                                    &mut package_file_hashes,
+                                )
+                                .await;
                             }
                         }
 
@@ -2599,6 +2715,31 @@ mod test {
     }
 
     #[tokio::test]
+    async fn watcher_rediscovers_for_root_manifest_change_hidden_by_rescan() {
+        // Contract: a change to the root package.json whose own file event was
+        // lost in a rescan still triggers rediscovery, since the root manifest
+        // can change which packages exist and how they depend on each other.
+        let (_tmp, repo_root) = setup_git_repo();
+        let handle = create_test_watcher(&repo_root);
+        let mut rx = handle.watcher.package_change_events_rx.resubscribe();
+        let initial = recv_event(&mut rx, Duration::from_secs(2)).await;
+        assert!(matches!(initial, Some(PackageChangeEvent::Rediscover)));
+
+        let manifest = repo_root.join_component("package.json");
+        let mut contents = manifest.read_to_string().unwrap();
+        contents.push('\n');
+        manifest.create_with_contents(contents.as_bytes()).unwrap();
+        send_rescan(&handle);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let event = recv_event(&mut rx, Duration::from_secs(5)).await;
+        assert!(
+            matches!(event, Some(PackageChangeEvent::Rediscover)),
+            "expected Rediscover for a root manifest change hidden by a rescan, got {event:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn watcher_ignores_rescan_storm_when_no_package_content_changed() {
         // Contract: a burst of rescans with unchanged contents reports no
         // change either. Each rescan fails the hash lookups still in flight,
@@ -2615,6 +2756,59 @@ mod test {
             send_rescan(&handle);
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        assert_next_change_is_edit_of_b(&handle, &mut rx, &repo_root).await;
+    }
+
+    #[tokio::test]
+    async fn watcher_ignores_rescan_after_a_handled_edit_inside_a_package() {
+        // Contract: once an edit inside a package has been reported, a later
+        // rescan with no further changes reports nothing, so the first rescan
+        // after ordinary editing does not rebuild every package.
+        let (_tmp, repo_root) = setup_git_repo();
+        let handle = create_test_watcher(&repo_root);
+        let mut rx = handle.watcher.package_change_events_rx.resubscribe();
+        let initial = recv_event(&mut rx, Duration::from_secs(2)).await;
+        assert!(matches!(initial, Some(PackageChangeEvent::Rediscover)));
+
+        let file = repo_root.join_components(&["packages", "a", "index.ts"]);
+        file.create_with_contents(b"export const a = 2;").unwrap();
+        let event = make_notify_event_from(&[&file]);
+        handle.hash_events_tx.send(Ok(event.clone())).unwrap();
+        handle.file_events_tx.send(Ok(event)).unwrap();
+        let event = recv_event(&mut rx, Duration::from_secs(5)).await;
+        assert!(
+            matches!(&event, Some(PackageChangeEvent::Package { name, .. }) if name.to_string() == "a"),
+            "expected the edit of a to be reported, got {event:?}"
+        );
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        send_rescan(&handle);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        assert_next_change_is_edit_of_b(&handle, &mut rx, &repo_root).await;
+    }
+
+    #[tokio::test]
+    async fn watcher_ignores_rescan_after_an_edit_to_a_root_file() {
+        // Contract: an edit to a root-level file that no root task uses is not
+        // reported, and a later rescan with no further changes reports nothing
+        // either, so the edit cannot resurface as a full rebuild.
+        let (_tmp, repo_root) = setup_git_repo();
+        let readme = repo_root.join_component("README.md");
+        readme.create_with_contents(b"# repo\n").unwrap();
+        let handle = create_test_watcher(&repo_root);
+        let mut rx = handle.watcher.package_change_events_rx.resubscribe();
+        let initial = recv_event(&mut rx, Duration::from_secs(2)).await;
+        assert!(matches!(initial, Some(PackageChangeEvent::Rediscover)));
+
+        readme.create_with_contents(b"# repo, edited\n").unwrap();
+        let event = make_notify_event_from(&[&readme]);
+        handle.hash_events_tx.send(Ok(event.clone())).unwrap();
+        handle.file_events_tx.send(Ok(event)).unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        send_rescan(&handle);
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         assert_next_change_is_edit_of_b(&handle, &mut rx, &repo_root).await;
