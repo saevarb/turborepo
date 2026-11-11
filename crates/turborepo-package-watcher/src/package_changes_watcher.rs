@@ -18,7 +18,7 @@ use turborepo_daemon::{
 };
 use turborepo_filewatch::{
     RepositoryIgnore, WatchScope, WatchSource,
-    hash_watcher::{HashSpec, HashWatcher, InputGlobs},
+    hash_watcher::{Error as HashWatcherError, HashSpec, HashWatcher, InputGlobs},
 };
 use turborepo_microfrontends_config::UnifiedTurboJsonLoader;
 use turborepo_repository::{
@@ -274,6 +274,31 @@ fn baseline_matches(
     baseline.is_some_and(|baseline| {
         baseline.path.as_str() == path.as_str() && baseline.hashes.as_ref() == hashes
     })
+}
+
+/// Records `hashes` as the package's baseline and reports whether they match
+/// the baseline they replace.
+fn replace_baseline(
+    baselines: &mut HashMap<PackageName, PackageHashBaseline>,
+    name: &PackageName,
+    path: AnchoredSystemPathBuf,
+    hashes: Arc<GitHashes>,
+) -> bool {
+    let same = baseline_matches(baselines.get(name), &path, hashes.as_ref());
+    baselines.insert(name.clone(), PackageHashBaseline { path, hashes });
+    same
+}
+
+/// The outcome of re-hashing every package after the file watcher lost track
+/// of which files changed.
+enum Recheck {
+    /// Every package still matches its baseline.
+    Unchanged,
+    /// Some package differs from its baseline or could not be hashed.
+    Changed,
+    /// A lookup was cut short by a later invalidation, which has already
+    /// queued another full re-check.
+    Superseded,
 }
 
 fn hash_scopes(pkg_dep_graph: &PackageGraph) -> impl Iterator<Item = WorkspacePackage> + '_ {
@@ -660,19 +685,7 @@ impl Subscriber {
             return false;
         };
 
-        let same = baseline_matches(
-            package_file_hashes.get(&pkg.name),
-            &package_path,
-            hash.as_ref(),
-        );
-        package_file_hashes.insert(
-            pkg.name.clone(),
-            PackageHashBaseline {
-                path: package_path,
-                hashes: hash,
-            },
-        );
-        if !same {
+        if !replace_baseline(package_file_hashes, &pkg.name, package_path, hash) {
             return false;
         }
         tracing::debug!("hashes are the same, no need to rerun");
@@ -680,26 +693,60 @@ impl Subscriber {
         true
     }
 
-    /// Re-hashes every package in the graph and reports whether all of them
-    /// still match their baseline. Every package is checked, so each baseline
-    /// is refreshed even after the first mismatch. A failed hash query counts
-    /// as a change.
-    async fn all_packages_unchanged(
+    /// Re-hashes every package after the file watcher lost track of which
+    /// files changed. Every package is checked, so each baseline is refreshed
+    /// even after the first mismatch.
+    ///
+    /// A lookup the hash watcher answers with `Unavailable` was cut short by
+    /// another flush and says nothing about the files. If that flush came with
+    /// a new invalidation, the next batch re-checks every package, so this
+    /// check defers to it. Any other failed lookup counts as a change.
+    async fn recheck_all_packages(
         &self,
         pkg_dep_graph: &PackageGraph,
         package_file_hashes: &mut HashMap<PackageName, PackageHashBaseline>,
-    ) -> bool {
-        let mut unchanged = true;
+    ) -> Recheck {
+        let mut changed = false;
+        let mut interrupted = false;
         for package in hash_scopes(pkg_dep_graph) {
-            if !self
-                .is_same_hash(pkg_dep_graph, &package, package_file_hashes)
-                .await
-            {
-                tracing::debug!(package = %package.name, "package contents changed");
-                unchanged = false;
+            let Some(context) = pkg_dep_graph.package_task_context(&package.name) else {
+                changed = true;
+                continue;
+            };
+            let package_path = context.directory().to_owned();
+            let lookup = self
+                .hash_watcher
+                .get_file_hashes(HashSpec {
+                    package_path: package_path.clone(),
+                    inputs: InputGlobs::Default,
+                })
+                .await;
+            match lookup {
+                Ok(hash) => {
+                    if !replace_baseline(package_file_hashes, &package.name, package_path, hash) {
+                        tracing::debug!(package = %package.name, "package contents changed");
+                        changed = true;
+                    }
+                }
+                Err(HashWatcherError::Unavailable(reason)) => {
+                    tracing::debug!(package = %package.name, %reason, "hash lookup interrupted");
+                    interrupted = true;
+                }
+                Err(error) => {
+                    tracing::debug!(package = %package.name, %error, "hash lookup failed");
+                    changed = true;
+                }
             }
         }
-        unchanged
+        if changed {
+            Recheck::Changed
+        } else if !interrupted {
+            Recheck::Unchanged
+        } else if self.changed_files.lock().await.borrow().is_empty() {
+            Recheck::Changed
+        } else {
+            Recheck::Superseded
+        }
     }
 
     async fn hash_baseline(
@@ -927,17 +974,19 @@ impl Subscriber {
                     // (a backend rescan, a lagged channel, or an unrepresentable
                     // path), not that anything did. Re-hash every package against
                     // its baseline and rediscover only if some content differs.
-                    if self
-                        .all_packages_unchanged(&repo_state.pkg_dep_graph, &mut package_file_hashes)
+                    match self
+                        .recheck_all_packages(&repo_state.pkg_dep_graph, &mut package_file_hashes)
                         .await
                     {
-                        tracing::info!(
+                        Recheck::Unchanged => tracing::info!(
                             "file watcher lost events, but no package contents changed; skipping \
                              rediscovery"
-                        );
-                        continue;
+                        ),
+                        Recheck::Superseded => tracing::debug!(
+                            "package re-check interrupted by a later invalidation; re-checking"
+                        ),
+                        Recheck::Changed => rediscover!(self, repo_state, change_mapper),
                     }
-                    rediscover!(self, repo_state, change_mapper);
                     continue;
                 };
 
@@ -2472,6 +2521,103 @@ mod test {
             recv_event(&mut rx, Duration::from_secs(1)).await.is_none(),
             "unchanged content should be deduplicated"
         );
+    }
+
+    /// A backend rescan as the OS watcher reports it (FSEvents
+    /// `MustScanSubDirs`, inotify `IN_Q_OVERFLOW`): the file watcher turns it
+    /// into an invalidation for every subscriber.
+    fn rescan_event() -> notify::Event {
+        notify::Event::new(EventKind::Other).set_flag(notify::event::Flag::Rescan)
+    }
+
+    fn send_rescan(handle: &TestWatcherHandle) {
+        handle.hash_events_tx.send(Ok(rescan_event())).unwrap();
+        handle.file_events_tx.send(Ok(rescan_event())).unwrap();
+    }
+
+    /// Edits package `b` and asserts that the next reported change is exactly
+    /// that edit. Anything reported for an earlier rescan would arrive first,
+    /// so this shows the rescan was handled without reporting a change instead
+    /// of only that nothing arrived within some wait.
+    async fn assert_next_change_is_edit_of_b(
+        handle: &TestWatcherHandle,
+        rx: &mut broadcast::Receiver<PackageChangeEvent>,
+        repo_root: &AbsoluteSystemPathBuf,
+    ) {
+        let file = repo_root.join_components(&["packages", "b", "index.ts"]);
+        file.create_with_contents(b"export const b = 3;").unwrap();
+        let event = make_notify_event_from(&[&file]);
+        handle.hash_events_tx.send(Ok(event.clone())).unwrap();
+        handle.file_events_tx.send(Ok(event)).unwrap();
+
+        let event = recv_event(rx, Duration::from_secs(5)).await;
+        assert!(
+            matches!(&event, Some(PackageChangeEvent::Package { name, .. }) if name.to_string() == "b"),
+            "expected the edit of b to be the next reported change, got {event:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn watcher_ignores_rescan_when_no_package_content_changed() {
+        // Contract: when the OS watcher drops events and asks for a rescan but
+        // no package's contents changed, no change is reported, so watch mode
+        // does not stop its persistent tasks and rebuild everything.
+        let (_tmp, repo_root) = setup_git_repo();
+        let handle = create_test_watcher(&repo_root);
+        let mut rx = handle.watcher.package_change_events_rx.resubscribe();
+        let initial = recv_event(&mut rx, Duration::from_secs(2)).await;
+        assert!(matches!(initial, Some(PackageChangeEvent::Rediscover)));
+
+        send_rescan(&handle);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        assert_next_change_is_edit_of_b(&handle, &mut rx, &repo_root).await;
+    }
+
+    #[tokio::test]
+    async fn watcher_reports_change_hidden_by_rescan() {
+        // Contract: an edit whose own file event was lost in a rescan is still
+        // reported, so skipping work after a rescan never leaves stale builds.
+        let (_tmp, repo_root) = setup_git_repo();
+        let handle = create_test_watcher(&repo_root);
+        let mut rx = handle.watcher.package_change_events_rx.resubscribe();
+        let initial = recv_event(&mut rx, Duration::from_secs(2)).await;
+        assert!(matches!(initial, Some(PackageChangeEvent::Rediscover)));
+
+        repo_root
+            .join_components(&["packages", "a", "index.ts"])
+            .create_with_contents(b"export const a = 2;")
+            .unwrap();
+        send_rescan(&handle);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let event = recv_event(&mut rx, Duration::from_secs(5)).await;
+        assert!(
+            event.is_some(),
+            "an edit hidden by a rescan must still be reported"
+        );
+    }
+
+    #[tokio::test]
+    async fn watcher_ignores_rescan_storm_when_no_package_content_changed() {
+        // Contract: a burst of rescans with unchanged contents reports no
+        // change either. Each rescan fails the hash lookups still in flight,
+        // and a failed lookup says nothing about whether a file changed.
+        let (_tmp, repo_root) = setup_git_repo();
+        let handle = create_test_watcher(&repo_root);
+        let mut rx = handle.watcher.package_change_events_rx.resubscribe();
+        let initial = recv_event(&mut rx, Duration::from_secs(2)).await;
+        assert!(matches!(initial, Some(PackageChangeEvent::Rediscover)));
+
+        // Longer than one change batch, so the re-check runs while rescans are
+        // still arriving.
+        for _ in 0..100 {
+            send_rescan(&handle);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        assert_next_change_is_edit_of_b(&handle, &mut rx, &repo_root).await;
     }
 
     #[tokio::test]
